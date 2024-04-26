@@ -132,7 +132,7 @@ def hash_headers(header_to_hash: str):
                 value = re.sub(b'\r\n', b"", value)
                 value = re.sub(b'\\s+', b" ", value) + b"\r\n"
                 if is_dkim and header_to_hash_number == len(header_to_hash_list):
-                    value = re.sub(b'b=[\\w\\s/+=;]{25,}$', b"b=", value)
+                    value = re.sub(b'b=[\\w\\s/+=]{25,}', b"b=", value.rstrip())
                 headers += header_to_hash.lower().encode() + b":" + value
                 break
             else:
@@ -140,7 +140,7 @@ def hash_headers(header_to_hash: str):
                 value = header
                 if (re.match(b"DKIM-Signature", header, re.IGNORECASE)
                         and header_to_hash_number == len(header_to_hash_list)):
-                    value = re.sub(b'b=[\\w\\s/+=;]{25,}$', b"b=", header.rstrip())
+                    value = re.sub(b'b=[\\w\\s/+=]{25,}', b"b=", header.rstrip())
                 headers += value
                 break
 
