@@ -23,6 +23,8 @@ def hash_body() -> str:
 
     # canonical type of - headers/body : simple or relaxed
     type_algo = dkim_parameter['c'].split('/')
+    if len(type_algo) == 1:
+        type_algo.append("simple")
 
     start_body_position = start_body + 4
 
