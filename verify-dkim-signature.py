@@ -35,10 +35,15 @@ def hash_body(body: bytes) -> str:
     else:
         canonical_body = re.sub(b"[\\r\\n]+$", b"\r\n", mail_bin[start_body_position:])
 
+    # the last line of body finish always with only one CRLF
+    if body != b"":
+        canonical_body = re.sub(b"[\\r\\n]+$", b"\r\n", body)
+
     if type_algo[1] == "relaxed":
         canonical_body = re.sub(b"[ \t]+\r\n", b"\r\n", canonical_body)
         canonical_body = re.sub(b"[ \t]+", b" ", canonical_body)
 
+    # if body is empty, add one null line
     if canonical_body == "":
         canonical_body += b"\r\n"
 
