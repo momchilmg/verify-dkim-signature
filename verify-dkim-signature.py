@@ -18,6 +18,7 @@ from base64 import b64encode, b64decode
 
 
 def hash_body() -> str:
+def hash_body(body: bytes) -> str:
     # https://datatracker.ietf.org/doc/html/rfc6376#section-3.4.3
     # https://datatracker.ietf.org/doc/html/rfc6376#section-3.4.4
 
@@ -259,7 +260,7 @@ if __name__ == '__main__':
             print("No more DKIM signatures to verify. Signature is NOT valid.")
             break
 
-        body_hash = hash_body()
+        body_hash = hash_body(b"")
 
         if body_hash == dkim_parameter['bh']:
             print("Body hash matches.")
