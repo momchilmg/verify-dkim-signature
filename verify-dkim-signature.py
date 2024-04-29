@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+import os
+import time
 from typing import Dict
 import re
 import sys
@@ -11,10 +13,133 @@ from Crypto.Util.number import bytes_to_long, long_to_bytes
 from pathlib import Path
 import dns.resolver
 from base64 import b64encode, b64decode
+import shutil
+import threading
 
 
 # RFC info about SMTP here : https://datatracker.ietf.org/doc/html/rfc5321
 # RFC info about DKIM here : https://datatracker.ietf.org/doc/html/rfc6376
+
+lock_thread = threading.Lock()
+lock_thread_str = threading.Lock()
+sorted_body = b""
+number = 0
+number_body = 0
+
+
+def repair_body(body: bytes):
+    # some email clients and/or servers add or remove one extra CRLF before the boundary
+    # this function will try to correct this error
+
+    body = body.splitlines(True)
+
+    base_boundary = b""
+    for header in mail_headers:
+        if re.match(b"^Content-Type:.*multipart/.*", header, re.IGNORECASE):
+            base_boundary = re.search(b"boundary=(.+)", header, re.IGNORECASE).group(1).strip()
+            base_boundary = base_boundary.replace(b"\"", b"")
+            break
+    if base_boundary == b"":
+        return
+
+    header_start = False
+    body_boundary = [base_boundary]
+    for body_line in body:
+        if re.match(b"^--" + base_boundary + b"\r\n", body_line, re.IGNORECASE):
+            header_start = True
+            continue
+        if header_start and re.match(b".*boundary=.+", body_line, re.IGNORECASE):
+            header_start = False
+            base_boundary = re.search(b"boundary=(.+)", body_line, re.IGNORECASE).group(1).strip()
+            body_boundary.append(base_boundary.replace(b"\"", b""))
+
+    sorted_body_raw = []
+    number_boundary = 0
+    for line_body in body:
+        for boundary in body_boundary:
+            if re.match(b"^--" + boundary + b"(--)?\r\n", line_body, re.IGNORECASE):
+                number_boundary = number_boundary + 1
+                line_body = b"@#@#@" + bytes(number_boundary) + line_body
+                break
+        sorted_body_raw.append(line_body)
+    if number_boundary <= 0:
+        return
+
+    global sorted_body
+    global number
+    iter_num = 0
+    iter_step = 1000
+    number_local = 1
+    number = number_local
+    while iter_num < len(sorted_body_raw):
+        threading.Thread(str_append(sorted_body_raw[iter_num:iter_num+iter_step], number_local))
+        iter_num += iter_step
+        number_local = number_local + 1
+
+    count_threads = pow(2, number_boundary) * 2
+    size_limit = count_threads * (len(sorted_body) / 1048576)  # MB
+    if size_limit > 20000:  # limit 20GB
+        return
+    count_iter = size_limit / 18000  # limit RAM usage to 18GB
+    nbr_threads_max = int(count_threads / count_iter)
+    deep = int(count_threads / nbr_threads_max)
+    if deep >= 1:
+        deep = deep + 1
+    th1 = threading.Thread(target=repair_body_recursive, args=(sorted_body, number_boundary, True, deep))
+    th2 = threading.Thread(target=repair_body_recursive, args=(sorted_body, number_boundary, False, deep))
+    th1.start()
+    th2.start()
+    th1.join()
+    th2.join()
+
+
+def repair_body_recursive(body_in: bytes, number_recursive: int, in_out: bool, deep: int):
+    if in_out:
+        body_in = re.sub(b"@#@#@" + bytes(number_recursive), b"\r\n", body_in, 1)
+    else:
+        body_in = re.sub(b"@#@#@" + bytes(number_recursive), b"", body_in, 1)
+
+    if number_recursive == 1:
+        lock_thread.acquire()
+        global number_body
+        number_body = number_body + 1
+        tmp_number = str(number_body)
+        lock_thread.release()
+        Path("./body/").mkdir(parents=True, exist_ok=True)
+        f = open("./body/body" + tmp_number.zfill(10) + ".txt", "ab")
+        f.write(body_in)
+        f.close()
+        return
+
+    th1 = threading.Thread(target=repair_body_recursive, args=(body_in, number_recursive - 1, True, deep - 1))
+    th2 = threading.Thread(target=repair_body_recursive, args=(body_in, number_recursive - 1, False, deep - 1))
+    if deep <= 0:
+        th1.start()
+        th2.start()
+        th1.join()
+        th2.join()
+    else:
+        th1.start()
+        th1.join()
+        th2.start()
+        th2.join()
+
+
+def str_append(body_part: [], iter_num: int):
+    global sorted_body
+    global number
+
+    body_temp = b""
+    for line_body in body_part:
+        body_temp += line_body
+
+    while number != iter_num:
+        time.sleep(1)
+
+    lock_thread_str.acquire()
+    number = iter_num + 1
+    sorted_body += body_temp
+    lock_thread_str.release()
 
 
 def hash_body(body: bytes) -> str:
@@ -213,6 +338,19 @@ if __name__ == '__main__':
         print(f"Error! The file {mail_file} is missing.")
         exit(1)
 
+    if os.path.isdir("./body/"):
+        shutil.rmtree("./body/")
+
+    dst_validated = ""
+    if dst_validated != "":
+        Path(dst_validated).mkdir(parents=True, exist_ok=True)
+    dst_validated_corrected = ""
+    if dst_validated_corrected != "":
+        Path(dst_validated_corrected).mkdir(parents=True, exist_ok=True)
+    dst_non_validated = ""
+    if dst_non_validated != "":
+        Path(dst_non_validated).mkdir(parents=True, exist_ok=True)
+
     mail_bin = open(mail_file, "rb").read()
 
     mail = email.message_from_bytes(open(mail_file, "rb").read())
@@ -272,9 +410,30 @@ if __name__ == '__main__':
 
         if body_hash == dkim_parameter['bh']:
             print("Body hash matches.")
+            if dst_validated != "":
+                shutil.copy(mail_file_check, dst_validated)
         else:
-            print(f"Body hash mismatch.\nGot \"{body_hash}\" but expected \"{dkim_parameter['bh']}\".")
-            break
+            cont = False
+            body_array = []
+            body_binary = []
+            rec_final = []
+            repair_body(mail_bin[start_body + 4:])
+            if os.path.isdir("./body/"):
+                body_files = os.listdir("./body/")
+                for body_file in body_files:
+                    if hash_body(open("./body/" + body_file, "rb").read()) == dkim_parameter['bh']:
+                        print("Body hash matches. (corrected)")
+                        if dst_validated_corrected != "":
+                            shutil.copy(mail_file_check, dst_validated_corrected)
+                        cont = True
+                        break
+                if os.path.isdir("./body/"):
+                    shutil.rmtree("./body/")
+            if not cont:
+                if dst_non_validated != "":
+                    shutil.copy(mail_file_check, dst_non_validated)
+                print(f"Body hash mismatch.\nGot \"{body_hash}\" but expected \"{dkim_parameter['bh']}\".")
+                break
 
         public_key = get_public_key(dkim_parameter['d'], dkim_parameter['s'])
         if public_key is None:
