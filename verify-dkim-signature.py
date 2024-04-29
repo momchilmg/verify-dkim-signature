@@ -76,7 +76,11 @@ def get_public_key(domain: str, selector: str):
     else:
         # Public DKIM key extraction from DNS records
         dns.resolver.Resolver().nameservers = ['8.8.8.8', '4.4.4.4', '1.1.1.1', '208.67.222.222', '208.67.220.220']
-        dns_answer = dns.resolver.resolve("{}._domainkey.{}.".format(selector, domain), "TXT").response.answer
+        try:
+            dns_answer = dns.resolver.resolve("{}._domainkey.{}.".format(selector, domain), "TXT").response.answer
+        except ValueError:
+            return None
+
         for key in dns_answer:
             if re.match(".*TXT.*p=.*", key.to_text()):
                 dkim_pub = key.to_text()
