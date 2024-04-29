@@ -17,7 +17,6 @@ from base64 import b64encode, b64decode
 # RFC info about DKIM here : https://datatracker.ietf.org/doc/html/rfc6376
 
 
-def hash_body() -> str:
 def hash_body(body: bytes) -> str:
     # https://datatracker.ietf.org/doc/html/rfc6376#section-3.4.3
     # https://datatracker.ietf.org/doc/html/rfc6376#section-3.4.4
