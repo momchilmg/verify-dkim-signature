@@ -15,20 +15,20 @@ import dns.resolver
 from base64 import b64encode, b64decode
 import shutil
 import threading
-
+import math
+import psutil
 
 # RFC info about SMTP here : https://datatracker.ietf.org/doc/html/rfc5321
 # RFC info about DKIM here : https://datatracker.ietf.org/doc/html/rfc6376
 
 lock_thread = threading.Lock()
-lock_thread_str = threading.Lock()
 sorted_body = b""
 number = 0
-number_body = 0
+body_hash_sum_ok = False
 
 
 def repair_body(body: bytes):
-    # some email clients and/or servers add or remove one extra CRLF before the boundary
+    # some email clients and/or servers remove one extra CRLF before the boundary
     # this function will try to correct this error
 
     body = body.splitlines(True)
@@ -62,6 +62,7 @@ def repair_body(body: bytes):
                 line_body = b"@#@#@" + bytes(number_boundary) + line_body
                 break
         sorted_body_raw.append(line_body)
+
     if number_boundary <= 0:
         return
 
@@ -69,22 +70,23 @@ def repair_body(body: bytes):
     global number
     iter_num = 0
     iter_step = 1000
+
+    # for add extra CRLF
     number_local = 1
     number = number_local
     while iter_num < len(sorted_body_raw):
-        threading.Thread(str_append(sorted_body_raw[iter_num:iter_num+iter_step], number_local))
+        threading.Thread(str_append(sorted_body_raw[iter_num:iter_num + iter_step], number_local))
         iter_num += iter_step
         number_local = number_local + 1
 
     count_threads = pow(2, number_boundary) * 2
-    size_limit = count_threads * (len(sorted_body) / 1048576)  # MB
-    if size_limit > 20000:  # limit 20GB
-        return
-    count_iter = size_limit / 18000  # limit RAM usage to 18GB
+    # if count_threads > 16384:  # the time to proceed will be too big
+    #    return
+    # limit RAM usage to 3/4 of total RAM
+    total_use_ram_size = ((psutil.virtual_memory().total / 1024) / 1024) * 0.75
+    count_iter = (count_threads * (len(sorted_body) / 1048576)) / total_use_ram_size
     nbr_threads_max = int(count_threads / count_iter)
-    deep = int(count_threads / nbr_threads_max)
-    if deep >= 1:
-        deep = deep + 1
+    deep = number_boundary - (math.log(nbr_threads_max) / math.log(2))  # to prevent out of memory error
     th1 = threading.Thread(target=repair_body_recursive, args=(sorted_body, number_boundary, True, deep))
     th2 = threading.Thread(target=repair_body_recursive, args=(sorted_body, number_boundary, False, deep))
     th1.start()
@@ -93,22 +95,21 @@ def repair_body(body: bytes):
     th2.join()
 
 
-def repair_body_recursive(body_in: bytes, number_recursive: int, in_out: bool, deep: int):
+def repair_body_recursive(body_in: bytes, number_recursive: int, in_out: bool, deep: float):
+    global body_hash_sum_ok
+    if body_hash_sum_ok:
+        return
+
     if in_out:
         body_in = re.sub(b"@#@#@" + bytes(number_recursive), b"\r\n", body_in, 1)
     else:
         body_in = re.sub(b"@#@#@" + bytes(number_recursive), b"", body_in, 1)
 
     if number_recursive == 1:
-        lock_thread.acquire()
-        global number_body
-        number_body = number_body + 1
-        tmp_number = str(number_body)
-        lock_thread.release()
-        Path("./body/").mkdir(parents=True, exist_ok=True)
-        f = open("./body/body" + tmp_number.zfill(10) + ".txt", "ab")
-        f.write(body_in)
-        f.close()
+        if hash_body([body_in]) == dkim_parameter['bh']:
+            lock_thread.acquire()
+            body_hash_sum_ok = True
+            lock_thread.release()
         return
 
     th1 = threading.Thread(target=repair_body_recursive, args=(body_in, number_recursive - 1, True, deep - 1))
@@ -134,17 +135,19 @@ def str_append(body_part: [], iter_num: int):
         body_temp += line_body
 
     while number != iter_num:
-        time.sleep(1)
+        time.sleep(0.05)
 
-    lock_thread_str.acquire()
+    lock_thread.acquire()
     number = iter_num + 1
     sorted_body += body_temp
-    lock_thread_str.release()
+    lock_thread.release()
 
 
-def hash_body(body: bytes) -> str:
+def hash_body(body_in: [bytes]) -> str:
     # https://datatracker.ietf.org/doc/html/rfc6376#section-3.4.3
     # https://datatracker.ietf.org/doc/html/rfc6376#section-3.4.4
+
+    # use body_in[0] (array) to save memory
 
     # canonical type of - headers/body : simple or relaxed
     type_algo = dkim_parameter['c'].split('/')
@@ -153,24 +156,27 @@ def hash_body(body: bytes) -> str:
 
     start_body_position = start_body + 4
 
+    if body_in[0] == b"":
+        body_in[0] = mail_bin[start_body_position:]
+
     # body length for hash is parameter 'l' in DKIM-Signature header
     if 'l' in dkim_parameter.keys():
-        canonical_body = re.sub(b"[\\r\\n]+$", b"\r\n",
-                                mail_bin[start_body_position: start_body_position + int(dkim_parameter['l'])])
+        body_in[0] = re.sub(b"[\\r\\n]+$", b"\r\n",
+                            body_in[0][: start_body_position + int(dkim_parameter['l'])])
     else:
-        canonical_body = re.sub(b"[\\r\\n]+$", b"\r\n", mail_bin[start_body_position:])
+        body_in[0] = re.sub(b"[\\r\\n]+$", b"\r\n", body_in[0])
 
-    # the last line of body finish always with only one CRLF
-    if body != b"":
-        canonical_body = re.sub(b"[\\r\\n]+$", b"\r\n", body)
+    # for threads
+    if body_in[0] != b"":
+        body_in[0] = re.sub(b"[\\r\\n]+$", b"\r\n", body_in[0])
 
     if type_algo[1] == "relaxed":
-        canonical_body = re.sub(b"[ \t]+\r\n", b"\r\n", canonical_body)
-        canonical_body = re.sub(b"[ \t]+", b" ", canonical_body)
+        body_in[0] = re.sub(b"[ \t]+\r\n", b"\r\n", body_in[0])
+        body_in[0] = re.sub(b"[ \t]+", b" ", body_in[0])
 
     # if body is empty, add one null line
-    if canonical_body == "":
-        canonical_body += b"\r\n"
+    if body_in[0] == "":
+        body_in[0] += b"\r\n"
 
     # for debug
     # f = open("body.txt", "wb")
@@ -179,15 +185,14 @@ def hash_body(body: bytes) -> str:
 
     bh = ""
     if dkim_parameter['a'] == "rsa-sha1":
-        bh = b64encode(SHA1.new(canonical_body).digest())
+        bh = b64encode(SHA1.new(body_in[0]).digest())
     elif dkim_parameter['a'] == "rsa-sha256":
-        bh = b64encode(SHA256.new(canonical_body).digest())
+        bh = b64encode(SHA256.new(body_in[0]).digest())
 
     return bh.decode()
 
 
 def get_public_key(domain: str, selector: str):
-
     dkim_pub = ""
 
     if domain == "gmail.com" and selector == "20161025":
@@ -406,30 +411,19 @@ if __name__ == '__main__':
             print("No more DKIM signatures to verify. Signature is NOT valid.")
             break
 
-        body_hash = hash_body(b"")
+        body_hash = hash_body([b""])
 
         if body_hash == dkim_parameter['bh']:
             print("Body hash matches.")
             if dst_validated != "":
                 shutil.copy(mail_file_check, dst_validated)
         else:
-            cont = False
-            body_array = []
-            body_binary = []
-            rec_final = []
             repair_body(mail_bin[start_body + 4:])
-            if os.path.isdir("./body/"):
-                body_files = os.listdir("./body/")
-                for body_file in body_files:
-                    if hash_body(open("./body/" + body_file, "rb").read()) == dkim_parameter['bh']:
-                        print("Body hash matches. (corrected)")
-                        if dst_validated_corrected != "":
-                            shutil.copy(mail_file_check, dst_validated_corrected)
-                        cont = True
-                        break
-                if os.path.isdir("./body/"):
-                    shutil.rmtree("./body/")
-            if not cont:
+            if body_hash_sum_ok:
+                print("Body hash matches. (corrected)")
+                if dst_validated_corrected != "":
+                    shutil.copy(mail_file_check, dst_validated_corrected)
+            else:
                 if dst_non_validated != "":
                     shutil.copy(mail_file_check, dst_non_validated)
                 print(f"Body hash mismatch.\nGot \"{body_hash}\" but expected \"{dkim_parameter['bh']}\".")

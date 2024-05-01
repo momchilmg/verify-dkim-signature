@@ -17,4 +17,5 @@ typing-extensions
 mypy  
 mypy-extensions  
 pycryptodome  
+psutil  
 
